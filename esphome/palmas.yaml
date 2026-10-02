@@ -1,0 +1,315 @@
+# Detector de palmas duplas — ESP32 + microfone INMP441 (I2S) + ESPHome.
+#
+# Tudo roda DENTRO do ESP32 (funciona sem internet). Quando ele reconhece duas
+# palmas seguidas, o binary_sensor "Palmas Duplas" pulsa por 600 ms; quem reage
+# é uma automação do Home Assistant (ver ../homeassistant/automacao.yaml).
+#
+# Ligação do INMP441:  VDD→3V3  GND→GND  L/R→GND  WS→GPIO26  SCK→GPIO27  SD→GPIO33
+# (L/R no GND = canal esquerdo, que é o que o `channel: left` abaixo espera)
+#
+# Testado com ESPHome 2026.8.
+
+esphome:
+  name: palmas-esp32
+  friendly_name: "Palmas ESP32"
+  on_boot:
+    priority: -100
+    then:
+      # Publica 'false' explícito: sem isso o binary_sensor nasce 'unknown' e uma
+      # automação com gatilho from: "off" ENGOLE a primeira palma depois de cada
+      # boot (a transição unknown→on não casa).
+      - lambda: 'id(palmas_duplas).publish_state(false);'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# -----------------------------------------------------------------------
+# Estado do detector
+# -----------------------------------------------------------------------
+globals:
+  # Nível de fundo adaptativo, em dBFS (já filtrado pelo passa-alta de 100 Hz).
+  - id: palmas_fundo
+    type: float
+    initial_value: '0.0'
+  # 0 = esperando | 1 = primeira palma em curso | 2 = armado p/ a segunda
+  # 3 = som longo ou disparo recente: só volta a 0 depois de um bloco sem "alto"
+  - id: palmas_estado
+    type: int
+    initial_value: '0'
+  - id: palmas_t0
+    type: uint32_t
+    initial_value: '0'
+  - id: palmas_ultimo_disparo
+    type: uint32_t
+    initial_value: '0'
+
+  # Passa-alta de 100 Hz (Butterworth 2ª ordem, forma transposta II).
+  # O RMS de banda larga é dominado por pressão/ar de 0,5–5 Hz (vento, porta,
+  # ventilador no microfone) e isso virava "palma". O detector lê palmas_rms_hp,
+  # que já vem filtrado.
+  - id: palmas_hp_s1
+    type: float
+    initial_value: '0.0'
+  - id: palmas_hp_s2
+    type: float
+    initial_value: '0.0'
+  - id: palmas_hp_soma
+    type: float
+    initial_value: '0.0'
+  - id: palmas_hp_n
+    type: int
+    initial_value: '0'
+  # dBFS do último bloco de 100 ms já filtrado. Escrito pela task do microfone,
+  # lido pelo loop principal (float de 32 bits, escrita atômica no ESP32).
+  - id: palmas_rms_hp
+    type: float
+    initial_value: '-60.0'
+  - id: palmas_hp_logado
+    type: bool
+    initial_value: 'false'
+
+  # Segundo passa-alta, 700 Hz, só para a REGRA DE FORMA da palma: palma tem
+  # energia espalhada acima de 700 Hz (1–4 kHz); voz e ruído grave (100–500 Hz)
+  # não. Razão RMS(700 Hz) − RMS(100 Hz): palmas medidas −2,2 a −0,1 dB; o resto
+  # (voz, TV, conversa) com mediana de −15 dB.
+  - id: palmas_hp2_s1
+    type: float
+    initial_value: '0.0'
+  - id: palmas_hp2_s2
+    type: float
+    initial_value: '0.0'
+  - id: palmas_hp2_soma
+    type: float
+    initial_value: '0.0'
+  - id: palmas_rms_hp2
+    type: float
+    initial_value: '-60.0'
+
+script:
+  - id: pulsar_palmas
+    mode: restart
+    then:
+      - logger.log: "PALMAS DUPLAS detectadas"
+      - lambda: 'id(palmas_duplas).publish_state(true);'
+      - delay: 600ms
+      - lambda: 'id(palmas_duplas).publish_state(false);'
+
+# -----------------------------------------------------------------------
+# Controles no Home Assistant
+# -----------------------------------------------------------------------
+number:
+  - platform: template
+    name: "Palmas: Limiar (dB acima do fundo)"
+    id: palmas_limiar
+    icon: "mdi:hand-clap"
+    entity_category: config
+    optimistic: true
+    min_value: 3.0
+    max_value: 35.0
+    step: 0.5
+    # 18 dB: com o passa-alta, minutos de silêncio nunca passaram de +11 dB acima do
+    # fundo e palmas reais (perto e longe do microfone, na mesma sala) deram +21 a
+    # +44 dB. Falso positivo? Suba. Palma não pega? Desça (14 foi o menor valor
+    # testado; a 8 o ruído grave do ambiente disparava sozinho).
+    initial_value: 18.0
+    restore_value: true
+
+switch:
+  - platform: template
+    name: "Palmas: Detector Ativo"
+    id: palmas_ativo
+    icon: "mdi:hand-clap"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# -----------------------------------------------------------------------
+# Microfone INMP441 (I2S)
+# -----------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_input
+    i2s_lrclk_pin: GPIO26  # WS
+    i2s_bclk_pin: GPIO27   # SCK
+
+microphone:
+  - platform: i2s_audio
+    id: mic_inmp441
+    i2s_audio_id: i2s_input
+    i2s_din_pin: GPIO33    # SD
+    adc_type: external
+    pdm: false
+    channel: left
+    correct_dc_offset: true
+    on_data:
+      # Passa-alta 100 Hz + RMS de 100 ms para o detector. Roda na task do
+      # microfone: só mexe em globals e NÃO chama o detector daqui (o detector
+      # roda no loop principal, no filtro do sensor abaixo).
+      - lambda: |-
+          constexpr float B0 = 0.972613871f, B1 = -1.945227742f, B2 = 0.972613871f;
+          constexpr float A1 = -1.944477677f, A2 = 0.945977926f;   // fc 100 Hz @ 16 kHz
+          constexpr float C0 = 0.823220789f, C1 = -1.646441579f, C2 = 0.823220789f;
+          constexpr float D1 = -1.614942670f, D2 = 0.677940488f;   // fc 700 Hz @ 16 kHz
+          const auto info = id(mic_inmp441)->get_audio_stream_info();
+          const uint8_t bits = info.get_bits_per_sample();
+          const uint8_t canais = info.get_channels();
+          const uint32_t taxa = info.get_sample_rate();
+          if (!id(palmas_hp_logado)) {
+            id(palmas_hp_logado) = true;
+            ESP_LOGI("palmas", "passa-alta: microfone %u bits, %u canal(is), %u Hz",
+                     (unsigned) bits, (unsigned) canais, (unsigned) taxa);
+          }
+          // Os coeficientes acima são para 16 kHz. Outra taxa = filtro errado.
+          if ((bits != 16 && bits != 32) || canais == 0 || taxa != 16000) return;
+          const size_t passo = (bits / 8) * canais;
+          const size_t n = x.size() / passo;
+          const int janela = taxa / 10;
+          for (size_t i = 0; i < n; i++) {
+            float v;
+            if (bits == 16) {
+              int16_t s;
+              memcpy(&s, &x[i * passo], sizeof(s));
+              v = s / 32768.0f;
+            } else {
+              int32_t s;
+              memcpy(&s, &x[i * passo], sizeof(s));
+              v = s / 2147483648.0f;
+            }
+            const float y = B0 * v + id(palmas_hp_s1);
+            id(palmas_hp_s1) = B1 * v - A1 * y + id(palmas_hp_s2);
+            id(palmas_hp_s2) = B2 * v - A2 * y;
+            id(palmas_hp_soma) += y * y;
+            const float y2 = C0 * v + id(palmas_hp2_s1);
+            id(palmas_hp2_s1) = C1 * v - D1 * y2 + id(palmas_hp2_s2);
+            id(palmas_hp2_s2) = C2 * v - D2 * y2;
+            id(palmas_hp2_soma) += y2 * y2;
+            if (++id(palmas_hp_n) >= janela) {
+              // Os dois globals são lidos sem trava pelo loop principal; se a leitura
+              // cair entre as duas escritas (microssegundos a cada 100 ms), a razão
+              // sai errada por UM bloco, que a máquina de estados absorve.
+              id(palmas_rms_hp2) = 10.0f * log10f(id(palmas_hp2_soma) / janela + 1e-12f);
+              id(palmas_rms_hp) = 10.0f * log10f(id(palmas_hp_soma) / janela + 1e-12f);
+              id(palmas_hp_soma) = 0.0f;
+              id(palmas_hp2_soma) = 0.0f;
+              id(palmas_hp_n) = 0;
+            }
+          }
+
+# -----------------------------------------------------------------------
+# Detector (roda a cada 100 ms, no filtro do sensor de nível de som)
+# -----------------------------------------------------------------------
+sensor:
+  - platform: sound_level
+    microphone:
+      microphone: mic_inmp441
+      gain_factor: 1   # >1 satura o INMP441 e o detector perde margem
+    passive: false
+    measurement_duration: 100ms
+    rms:
+      name: "Nível de Som (dBFS)"
+      id: mic_sound_level
+      unit_of_measurement: "dB"
+      accuracy_decimals: 1
+      state_class: measurement
+      filters:
+        # O detector vem PRIMEIRO, antes de qualquer outro filtro: ele precisa de
+        # uma amostra a cada 100 ms. O throttle no fim só poupa o Home Assistant.
+        - lambda: |-
+            if (!id(palmas_ativo).state) return x;
+
+            // O detector olha o nível JÁ FILTRADO (passa-alta 100 Hz, ver on_data
+            // do microfone); x é só o nível exibido.
+            const float xd = id(palmas_rms_hp);
+            const float xf = id(palmas_rms_hp2);
+            const uint32_t agora = millis();
+            // Primeiros 10 s: microfone estabilizando, só aprende o fundo.
+            if (agora < 10000) { id(palmas_fundo) = xd; return x; }
+
+            // Regra de forma: palma tem >= ~25% da energia acima de 700 Hz.
+            constexpr float PALMAS_RAZAO_MIN_DB = -6.0f;
+            const bool nivel_alto = xd > (id(palmas_fundo) + id(palmas_limiar).state);
+            const bool alto = nivel_alto && (xf - xd) > PALMAS_RAZAO_MIN_DB;
+
+            switch (id(palmas_estado)) {
+              case 0:                       // esperando a primeira palma
+                if (alto) {
+                  id(palmas_estado) = 1;
+                  id(palmas_t0) = agora;
+                }
+                break;
+
+              case 1:                       // primeira palma em curso
+                // Palma é transiente: tem que CAIR rápido. Som contínuo
+                // (música, voz alta, TV) não passa daqui.
+                if (!alto) {
+                  id(palmas_estado) = (agora - id(palmas_t0) <= 250) ? 2 : 0;
+                } else if (agora - id(palmas_t0) > 250) {
+                  id(palmas_estado) = 3;    // som longo: só rearma depois de um bloco sem "alto"
+                }
+                break;
+
+              case 3:                       // espera o som acabar antes de rearmar
+                if (!alto) id(palmas_estado) = 0;
+                break;
+
+              default: {                    // armado, esperando a segunda
+                const uint32_t gap = agora - id(palmas_t0);
+                if (gap > 900) {
+                  id(palmas_estado) = 0;
+                } else if (alto && gap >= 200) {
+                  id(palmas_estado) = 3;
+                  // Carência de 3 s: eco e terceira palma não disparam de novo.
+                  if (agora - id(palmas_ultimo_disparo) > 3000) {
+                    id(palmas_ultimo_disparo) = agora;
+                    id(pulsar_palmas).execute();
+                  }
+                }
+                break;
+              }
+            }
+
+            // Fundo adaptativo só fora dos transientes.
+            if (!nivel_alto) {
+              id(palmas_fundo) = id(palmas_fundo) * 0.98f + xd * 0.02f;
+            }
+
+            return x;
+        - throttle: 1s
+
+  # Nível de fundo que o detector está usando — serve para ajustar o limiar sem
+  # precisar de log serial. Em silêncio fica em ~−54 a −57 dB.
+  - platform: template
+    name: "Palmas: Nível de Fundo"
+    id: palmas_fundo_sensor
+    entity_category: diagnostic
+    unit_of_measurement: "dB"
+    accuracy_decimals: 1
+    icon: "mdi:waveform"
+    lambda: 'return id(palmas_fundo);'
+    update_interval: 10s
+    filters:
+      - delta: 0.3
+
+binary_sensor:
+  # Pulso de 600 ms quando o detector reconhece duas palmas (ou dois estalos de
+  # dedo) seguidas. Quem reage é a automação do Home Assistant.
+  - platform: template
+    name: "Palmas Duplas"
+    id: palmas_duplas
+    device_class: sound
+    icon: "mdi:hand-clap"

@@ -1,0 +1,52 @@
+# Automação do Home Assistant: duas palmas alternam as luzes.
+# Se QUALQUER luz da lista estiver acesa → apaga todas; se todas estiverem
+# apagadas → acende todas.
+#
+# Como usar: Configurações → Automações → ⋮ → Editar em YAML, e cole isto.
+# Troque `luzes` pelas suas entidades e confira o nome do binary_sensor
+# (Configurações → Dispositivos → "Palmas ESP32").
+
+alias: "Palmas duplas: alterna as luzes"
+description: "Duas palmas no microfone do ESP32 acendem ou apagam as luzes."
+mode: single
+max_exceeded: silent
+
+variables:
+  luzes:
+    - light.sala
+    - light.cozinha
+
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.palmas_esp32_palmas_duplas
+    from: "off"
+    to: "on"
+
+conditions: []
+# Trava opcional contra falso positivo em ambiente barulhento: o fundo sobe e a
+# palma mais fraca deixa de passar do limiar. Descomente se precisar.
+#  - condition: numeric_state
+#    entity_id: sensor.palmas_esp32_palmas_nivel_de_fundo
+#    below: -45
+
+actions:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ luzes | select('is_state', 'on') | list | count > 0 }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ luzes }}"
+    default:
+      - action: light.turn_on
+        target:
+          entity_id: "{{ luzes }}"
+        # Opcional: brilho/cor ao acender.
+        # data:
+        #   brightness_pct: 80
+        #   color_temp_kelvin: 3000
+
+# Lâmpadas Tuya (nuvem) costumam dar "sign invalid" com várias chamadas
+# simultâneas. Se for o seu caso, troque o light.turn_on/off acima por uma
+# chamada por lâmpada com `delay: { milliseconds: 600 }` entre elas.
